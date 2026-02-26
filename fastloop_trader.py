@@ -112,4 +112,4 @@ if __name__ == "__main__":
             print(f"CRITICAL ERROR: {e}")
         
         # Wait 60 seconds before checking the market again
-        time.sleep(1)
+        time.sleep(30)
