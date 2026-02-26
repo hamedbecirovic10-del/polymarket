@@ -1,1 +1,2 @@
 simmer-sdk
+eth-account
