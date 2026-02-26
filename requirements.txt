@@ -1,3 +1,4 @@
 simmer-sdk
 eth-account
+requests
 websocket-client
