@@ -1,21 +1,17 @@
 import os
 import sys
 import json
-import time
+import websocket
 import argparse
 from datetime import datetime
 from simmer_sdk import SimmerClient
 
-# Configuration Defaults (Exactly like your original strategy)
+# Your original strategy settings
 DEFAULT_CONFIG = {
     "asset": "BTC",
     "window": "5m",
     "max_position": 5.0,
-    "daily_budget": 10.0,
     "min_momentum_pct": 0.5,
-    "entry_threshold": 0.05,
-    "volume_confidence": True,
-    "signal_source": "binance"
 }
 
 def load_config():
@@ -24,92 +20,84 @@ def load_config():
             return {**DEFAULT_CONFIG, **json.load(f)}
     return DEFAULT_CONFIG
 
-def get_binance_momentum(symbol="BTCUSDT"):
-    """Fetch 1m momentum from Binance"""
-    import requests
-    try:
-        # Fetches the last 5 minutes of 1-minute candles
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=5"
-        res = requests.get(url, timeout=10).json()
-        close_prices = [float(k[4]) for k in res]
-        current = close_prices[-1]
-        prev = close_prices[0]
-        momentum = ((current - prev) / prev) * 100
-        return momentum
-    except Exception as e:
-        print(f"Error fetching signal: {e}")
-        return 0.0
-
-def run_fast_market_strategy(dry_run=True, quiet=False):
-    config = load_config()
-    api_key = os.getenv("SIMMER_API_KEY")
-    venue = os.getenv("TRADING_VENUE", "polymarket")
-    
-    if not api_key:
-        print("❌ Error: SIMMER_API_KEY environment variable not set")
-        return
-
-    # Initialize the client (Handles the eth-account signing locally)
-    client = SimmerClient(api_key=api_key, venue=venue, live=(not dry_run))
-    
-    if not quiet:
-        print(f"\n⚡ Simmer Strategy Loop | {datetime.now().strftime('%H:%M:%S')}")
-        print(f"Checking {config['asset']} {config['window']} markets...")
-
-    # 1. Get Signal
-    momentum = get_binance_momentum()
-    if not quiet:
-        print(f"Current 5m Momentum: {momentum:+.3f}%")
-
-    # Only trade if momentum is strong enough
-    if abs(momentum) < config['min_momentum_pct']:
-        if not quiet: print(f"⏸ Momentum too weak (< {config['min_momentum_pct']}%). Skipping.")
-        return
-
-    side = "buy_yes" if momentum > 0 else "buy_no"
-
-    # 2. Find Markets via Simmer SDK
-    markets = client.get_fast_markets(asset=config['asset'], window=config['window'])
-    active_markets = [m for m in markets if m.get('active')]
-
-    if not active_markets:
-        if not quiet: print("📭 No active markets found.")
-        return
-
-    # 3. Execute Trade
-    target_market = active_markets[0]
-    market_id = target_market['id']
-    
-    if not quiet:
-        print(f"🚀 Signal detected! {side.upper()} on Market: {target_market['question']}")
-
-    try:
-        order = client.create_fast_market_order(
-            market_id=market_id,
-            side=side,
-            amount=config['max_position']
+class FastLoopBot:
+    def __init__(self, live=False, quiet=False):
+        self.live = live
+        self.quiet = quiet
+        self.config = load_config()
+        self.client = SimmerClient(
+            api_key=os.getenv("SIMMER_API_KEY"),
+            venue=os.getenv("TRADING_VENUE", "polymarket"),
+            live=live
         )
-        print(f"✅ Order placed: {order.get('id', 'Unknown ID')}")
-    except Exception as e:
-        print(f"❌ Execution failed: {e}")
+        # Store last 5 prices to calculate 5m momentum
+        self.price_history = [] 
+
+    def on_message(self, ws, message):
+        data = json.loads(message)
+        candle = data['k']
+        current_price = float(candle['c'])
+        is_candle_closed = candle['x']
+
+        # We update our history and check strategy every time a candle closes (every 1m)
+        # For true 100ms response, you can remove 'is_candle_closed' and check every tick
+        if is_candle_closed:
+            self.price_history.append(current_price)
+            if len(self.price_history) > 5:
+                self.price_history.pop(0)
+
+            if len(self.price_history) == 5:
+                self.check_strategy(current_price)
+
+    def check_strategy(self, current_price):
+        prev_price = self.price_history[0]
+        momentum = ((current_price - prev_price) / prev_price) * 100
+        
+        if not self.quiet:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Price: ${current_price:,.2f} | Momentum: {momentum:+.3f}%")
+
+        if abs(momentum) >= self.config['min_momentum_pct']:
+            self.execute_trade(momentum)
+
+    def execute_trade(self, momentum):
+        side = "buy_yes" if momentum > 0 else "buy_no"
+        try:
+            markets = self.client.get_fast_markets(asset=self.config['asset'], window=self.config['window'])
+            active = [m for m in markets if m.get('active')]
+            if active:
+                target = active[0]
+                order = self.client.create_fast_market_order(
+                    market_id=target['id'],
+                    side=side,
+                    amount=self.config['max_position']
+                )
+                print(f"🚀 TRADE EXECUTED: {side.upper()} | Order ID: {order.get('id')}")
+        except Exception as e:
+            print(f"❌ Trade Error: {e}")
+
+    def on_error(self, ws, error):
+        print(f"WebSocket Error: {error}")
+
+    def on_close(self, ws, close_status_code, close_msg):
+        print("### WebSocket Closed - Restarting... ###")
+        self.run() # Auto-restart on disconnect
+
+    def run(self):
+        symbol = self.config['asset'].lower() + "usdt"
+        socket = f"wss://stream.binance.com:9443/ws/{symbol}@kline_1m"
+        
+        ws = websocket.WebSocketApp(socket,
+                                  on_message=self.on_message,
+                                  on_error=self.on_error,
+                                  on_close=self.on_close)
+        ws.run_forever()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--live", action="store_true", help="Execute real trades")
-    parser.add_argument("--quiet", action="store_true", help="Minimize logs")
+    parser.add_argument("--live", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
-    if not args.live:
-        print("⚠️  RUNNING IN PAPER MODE (Dry Run). Use --live for real trading.")
-    else:
-        print("💰 REAL TRADING ENABLED. Stay safe.")
-
-    # THE INFINITE LOOP (Checks the market every 60 seconds)
-    while True:
-        try:
-            run_fast_market_strategy(dry_run=(not args.live), quiet=args.quiet)
-        except Exception as e:
-            print(f"CRITICAL ERROR: {e}")
-        
-        # Wait 60 seconds before checking the market again
-        time.sleep(30)
+    bot = FastLoopBot(live=args.live, quiet=args.quiet)
+    print(f"📡 Real-time WebSocket Bot Started ({'LIVE' if args.live else 'PAPER'} mode)")
+    bot.run()
